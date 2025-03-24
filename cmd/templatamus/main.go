@@ -1,4 +1,4 @@
-package templatamus
+package main
 
 import (
 	"fmt"
@@ -14,8 +14,21 @@ import (
 	"templatamus/internal/sync"
 )
 
+// These variables are set during compilation
+var (
+	Version   = "dev"
+	BuildDate = time.Now().Format(time.RFC3339)
+)
+
+func main() {
+	Main()
+}
+
 // Main is the entry point of the application
 func Main() {
+	// Display version information
+	fmt.Printf("Templatamus v%s (built %s)\n\n", Version, BuildDate)
+
 	// Load user configuration
 	cfg, err := config.LoadUserConfig()
 	if err != nil {
@@ -23,31 +36,25 @@ func Main() {
 	}
 
 	// Create GitHub client
-	ghClient := github.NewClient(cfg.Token)
+	client := github.NewClient(cfg.Token)
 
-	fmt.Println("Templatamus 1.0")
-
-	// Detect if we're in a templatamus project
-	projectDir, isProject, err := sync.DetectProject()
+	// Detect project
+	dir, isExisting, err := sync.DetectProject()
 	if err != nil {
-		log.Fatalf("Project detection failed: %v", err)
+		log.Fatalf("Error: %v", err)
 	}
 
-	if isProject {
-		// Sync existing project
-		fmt.Printf("Found templatamus project at: %s\n", projectDir)
-		if err := sync.SyncProject(projectDir, ghClient); err != nil {
-			log.Fatalf("Sync failed: %v", err)
+	if !isExisting {
+		// Create new project
+		if err := createNewProject(dir, cfg, client); err != nil {
+			log.Fatalf("Error: %v", err)
 		}
 	} else {
-		// Create new project
-		fmt.Printf("Creating new project at: %s\n", projectDir)
-		if err := createNewProject(projectDir, cfg, ghClient); err != nil {
-			log.Fatalf("Project creation failed: %v", err)
+		// Sync existing project
+		if err := sync.SyncProject(dir, client); err != nil {
+			log.Fatalf("Error: %v", err)
 		}
 	}
-
-	fmt.Println("Done!")
 }
 
 // getCommitSHAForTag gets the commit SHA for a tag

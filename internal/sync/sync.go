@@ -144,7 +144,27 @@ func SyncProject(dir string, ghClient *github.Client) error {
 
 	fmt.Printf("Found %d new commits that haven't been applied.\n", len(newCommits))
 
-	// Let user select commits to apply
+	// Sort commits by date (oldest first)
+	sort.Slice(newCommits, func(i, j int) bool {
+		return newCommits[i].Date.Before(newCommits[j].Date)
+	})
+
+	// Check for existing changes before proceeding
+	hasChanges, err := git.CheckRepoStatus(dir)
+	if err != nil {
+		return fmt.Errorf("failed to check repository status: %w", err)
+	}
+
+	if hasChanges {
+		fmt.Println("\nError: You have uncommitted changes or untracked files in your working directory.")
+		fmt.Println("Please either:")
+		fmt.Println("1. Commit your changes: git add . && git commit -m 'your message'")
+		fmt.Println("2. Stash your changes: git stash")
+		fmt.Println("\nThen run templatamus again to continue.")
+		return fmt.Errorf("working directory is not clean")
+	}
+
+	// Let user select which commits to apply
 	selectedCommits, err := cli.ChooseCommits(newCommits)
 	if err != nil {
 		return fmt.Errorf("commit selection failed: %w", err)
@@ -217,13 +237,28 @@ func SyncProject(dir string, ghClient *github.Client) error {
 			return fmt.Errorf("merge conflicts detected, please resolve manually and run templatamus again")
 		}
 
-		// Commit the changes
-		commitMsg := fmt.Sprintf("Synced with %s: %s", metadata.SourceRepo, strings.Split(commit.Message, "\n")[0])
-		if err := git.CommitChanges(dir, commitMsg); err != nil {
-			return fmt.Errorf("failed to commit changes: %w", err)
+		// Clean up any .rej files that might have been created
+		rejFiles, err := filepath.Glob(filepath.Join(dir, "*.rej"))
+		if err != nil {
+			return fmt.Errorf("failed to check for .rej files: %w", err)
+		}
+		for _, rejFile := range rejFiles {
+			if err := os.Remove(rejFile); err != nil {
+				return fmt.Errorf("failed to remove .rej file %s: %w", rejFile, err)
+			}
 		}
 
-		// Update metadata
+		// Clean up the patch file and sync status BEFORE committing
+		patchPath := filepath.Join(dir, ".templatamus", "conflict.patch")
+		if err := os.Remove(patchPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to remove patch file: %w", err)
+		}
+
+		if err := config.ClearSyncStatus(dir); err != nil {
+			return fmt.Errorf("failed to clear sync status: %w", err)
+		}
+
+		// Update metadata BEFORE committing
 		metadata.AppliedCommits = append(metadata.AppliedCommits, commit.SHA)
 		metadata.LastSyncedAt = time.Now()
 
@@ -231,7 +266,13 @@ func SyncProject(dir string, ghClient *github.Client) error {
 			return fmt.Errorf("failed to update metadata: %w", err)
 		}
 
-		fmt.Printf("Successfully applied commit: %s\n", commit.SHA[:8])
+		// Now commit the resolved changes
+		commitMsg := fmt.Sprintf("Synced with %s: %s (resolved conflicts)", metadata.SourceRepo, strings.Split(commit.Message, "\n")[0])
+		if err := git.CommitChanges(dir, commitMsg); err != nil {
+			return fmt.Errorf("failed to commit resolved changes: %w", err)
+		}
+
+		fmt.Printf("Successfully applied commit %s with resolved conflicts.\n", commit.SHA[:8])
 	}
 
 	fmt.Println("Sync completed successfully.")
@@ -261,10 +302,28 @@ func handleConflictResolution(dir string, metadata *model.ProjectMetadata, syncS
 		}
 
 		if abort {
+			// Clean up all temporary files
+			patchPath := filepath.Join(dir, ".templatamus", "conflict.patch")
+			if err := os.Remove(patchPath); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("failed to remove patch file: %w", err)
+			}
+
+			// Clean up any .rej files
+			rejFiles, err := filepath.Glob(filepath.Join(dir, "*.rej"))
+			if err != nil {
+				return fmt.Errorf("failed to check for .rej files: %w", err)
+			}
+			for _, rejFile := range rejFiles {
+				if err := os.Remove(rejFile); err != nil {
+					return fmt.Errorf("failed to remove .rej file %s: %w", rejFile, err)
+				}
+			}
+
 			// Clear the sync status
 			if err := config.ClearSyncStatus(dir); err != nil {
 				return fmt.Errorf("failed to clear sync status: %w", err)
 			}
+
 			fmt.Printf("Skipped commit %s due to unresolved conflicts.\n", commit.SHA[:8])
 			return nil
 		}
@@ -272,13 +331,28 @@ func handleConflictResolution(dir string, metadata *model.ProjectMetadata, syncS
 		return fmt.Errorf("sync aborted, please resolve conflicts and try again")
 	}
 
-	// Commit the resolved changes
-	commitMsg := fmt.Sprintf("Synced with %s: %s (resolved conflicts)", metadata.SourceRepo, strings.Split(commit.Message, "\n")[0])
-	if err := git.CommitChanges(dir, commitMsg); err != nil {
-		return fmt.Errorf("failed to commit resolved changes: %w", err)
+	// Clean up any .rej files that might have been created
+	rejFiles, err := filepath.Glob(filepath.Join(dir, "*.rej"))
+	if err != nil {
+		return fmt.Errorf("failed to check for .rej files: %w", err)
+	}
+	for _, rejFile := range rejFiles {
+		if err := os.Remove(rejFile); err != nil {
+			return fmt.Errorf("failed to remove .rej file %s: %w", rejFile, err)
+		}
 	}
 
-	// Update metadata
+	// Clean up the patch file and sync status BEFORE committing
+	patchPath := filepath.Join(dir, ".templatamus", "conflict.patch")
+	if err := os.Remove(patchPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove patch file: %w", err)
+	}
+
+	if err := config.ClearSyncStatus(dir); err != nil {
+		return fmt.Errorf("failed to clear sync status: %w", err)
+	}
+
+	// Update metadata BEFORE committing
 	metadata.AppliedCommits = append(metadata.AppliedCommits, commit.SHA)
 	metadata.LastSyncedAt = time.Now()
 
@@ -286,9 +360,10 @@ func handleConflictResolution(dir string, metadata *model.ProjectMetadata, syncS
 		return fmt.Errorf("failed to update metadata: %w", err)
 	}
 
-	// Clear the sync status
-	if err := config.ClearSyncStatus(dir); err != nil {
-		return fmt.Errorf("failed to clear sync status: %w", err)
+	// Now commit the resolved changes
+	commitMsg := fmt.Sprintf("Synced with %s: %s (resolved conflicts)", metadata.SourceRepo, strings.Split(commit.Message, "\n")[0])
+	if err := git.CommitChanges(dir, commitMsg); err != nil {
+		return fmt.Errorf("failed to commit resolved changes: %w", err)
 	}
 
 	fmt.Printf("Successfully applied commit %s with resolved conflicts.\n", commit.SHA[:8])
